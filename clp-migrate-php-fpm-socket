@@ -16,7 +16,7 @@ check_success() {
   fi
 }
 
-# Get a list of available domains
+# Get a list of available PHP domains
 domains=$(sqlite3 /home/clp/htdocs/app/data/db.sq3 "SELECT id, domain_name, INSTR(vhost_template, 'fastcgi_pass unix') as hasSocket FROM site WHERE type = 'php'")
 
 # Convert the list of domains into an array
@@ -28,102 +28,99 @@ if [ -z "$domains" ]; then
   exit 1
 fi
 
-# Display available PHP sites
-echo "Available PHP sites:"
+# Log the start of bulk migration
+log_message "Starting bulk migration of PHP domains to Unix sockets"
+
+# Process each domain
 for i in "${!domain_array[@]}"; do
-  IFS='|' read -ra domain_info <<< "${domain_array[i]}"
-  domain_name=${domain_info[1]}
-  hasSocket=${domain_info[2]}
-  echo "$((i + 1)). $domain_name ($([ "$hasSocket" -eq 0 ] && echo 'tcp' || echo 'socket'))"
+  # Parse domain information
+  IFS='|' read -ra selected_domain <<< "${domain_array[i]}"
+  site_id=${selected_domain[0]}
+  domain_name=${selected_domain[1]}
+  hasSocket=${selected_domain[2]}
+
+  # Skip domains already using sockets
+  if [ "$hasSocket" -ne 0 ]; then
+    log_message "Skipping $domain_name: Already using Unix socket"
+    continue
+  fi
+
+  log_message "----------------------------------------"
+  log_message "Migrating domain: $domain_name"
+
+  # Get the PHP version
+  php_version=$(sqlite3 /home/clp/htdocs/app/data/db.sq3 "SELECT php_version FROM php_settings WHERE site_id = $site_id")
+  check_success "Failed to get PHP version for $domain_name."
+
+  # Load pool configuration content
+  pool_config_file="/etc/php/$php_version/fpm/pool.d/$domain_name.conf"
+  if [ ! -f "$pool_config_file" ]; then
+    log_message "Error: Pool configuration file not found for $domain_name. Skipping."
+    continue
+  fi
+
+  # Extract user and group values from the pool configuration file
+  user=$(awk -F' = ' '/^user/ {print $2}' "$pool_config_file")
+  group=$(awk -F' = ' '/^group/ {print $2}' "$pool_config_file")
+
+  sock_path="/var/run/php/${domain_name}.sock"
+
+  # Create a backup of the pool configuration file
+  cp "$pool_config_file" "$pool_config_file.bak"
+
+  # Update pool configuration file
+  tmp_file=$(mktemp)
+  while IFS= read -r line; do
+    case "$line" in
+      "listen = 127.0.0.1:"*) 
+        echo "listen = $sock_path" >> "$tmp_file"
+        echo "listen.owner = $user" >> "$tmp_file"
+        echo "listen.group = $group" >> "$tmp_file"
+        ;;
+      "listen.allowed_clients"*|"listen.backlog"*)
+        continue
+        ;;
+      *)
+        echo "$line" >> "$tmp_file"
+        ;;
+    esac
+  done < "$pool_config_file"
+  mv "$tmp_file" "$pool_config_file"
+
+  log_message "Updated pool configuration in $pool_config_file"
+
+  escaped_sock_path=$(echo $sock_path | sed 's/\//\\\//g')
+
+  # Update vhost template in the database
+  vhost_template=$(sqlite3 /home/clp/htdocs/app/data/db.sq3 "SELECT vhost_template FROM site WHERE id = $site_id")
+  updated_vhost_template=$(echo "$vhost_template" | sed "s/fastcgi_pass 127.0.0.1:{{php_fpm_port}}/fastcgi_pass unix:$escaped_sock_path;/")
+  escaped_string="${updated_vhost_template//\'/\'\'}"
+  sqlite3 /home/clp/htdocs/app/data/db.sq3 "UPDATE site SET vhost_template = '$escaped_string' WHERE id = $site_id;"
+  check_success "Failed to update site vhost in CloudPanel database for $domain_name."
+  log_message "Updated site vhost in CloudPanel database for $domain_name"
+
+  # Update NGINX configuration
+  nginx_config_file="/etc/nginx/sites-enabled/$domain_name.conf"
+  if [ -f "$nginx_config_file" ]; then
+    cp "$nginx_config_file" "$nginx_config_file.bak"
+    sed -i "s/fastcgi_pass 127.0.0.1:[0-9]\+;/fastcgi_pass unix:$escaped_sock_path;/" "$nginx_config_file"
+    check_success "Failed to update $nginx_config_file"
+    log_message "Successfully updated $nginx_config_file for $domain_name"
+  else
+    log_message "Error: NGINX configuration file $nginx_config_file not found for $domain_name. Skipping."
+    continue
+  fi
+
+  # Restart services
+  systemctl restart "php$php_version-fpm.service"
+  check_success "Failed to restart PHP-FPM service for $domain_name."
+  log_message "Restarted PHP-FPM service for $domain_name"
+
+  systemctl reload nginx
+  check_success "Failed to reload NGINX service for $domain_name."
+  log_message "Reloaded NGINX service"
+
+  log_message "Migration completed for $domain_name"
 done
 
-read -p "Please pick a domain by entering its number: " domain_number
-
-if ! [[ $domain_number =~ ^[0-9]+$ ]] || [ -z "${domain_array[$((domain_number - 1))]}" ]; then
-  log_message "Invalid input or no site selected."
-  exit 2
-fi
-
-# Get the selected domain id and name
-IFS='|' read -ra selected_domain <<< "${domain_array[$((domain_number - 1))]}"
-site_id=${selected_domain[0]}
-domain_name=${selected_domain[1]}
-
-log_message "----------------------------------------"
-log_message "Starting migration of $domain_name"
-
-# Get the PHP version
-php_version=$(sqlite3 /home/clp/htdocs/app/data/db.sq3 "SELECT php_version FROM php_settings WHERE site_id = $site_id")
-check_success "Failed to get PHP version for $domain_name."
-
-# Load pool configuration content
-pool_config_file="/etc/php/$php_version/fpm/pool.d/$domain_name.conf"
-if [ ! -f "$pool_config_file" ]; then
-  log_message "Error: Pool configuration file not found!"
-  exit 5
-fi
-
-log_message "Found pool configuration for domain: $domain_name"
-
-# Extract user and group values from the pool configuration file
-user=$(awk -F' = ' '/^user/ {print $2}' "$pool_config_file")
-group=$(awk -F' = ' '/^group/ {print $2}' "$pool_config_file")
-
-sock_path="/var/run/php/${domain_name}.sock"
-
-# Create a backup of the pool configuration file
-cp "$pool_config_file" "$pool_config_file.bak"
-
-# Update pool configuration file
-tmp_file=$(mktemp)
-while IFS= read -r line; do
-  case "$line" in
-    "listen = 127.0.0.1:"*) 
-      echo "listen = $sock_path" >> "$tmp_file"
-      echo "listen.owner = $user" >> "$tmp_file"
-      echo "listen.group = $group" >> "$tmp_file"
-      ;;
-    "listen.allowed_clients"*|"listen.backlog"*)
-      continue
-      ;;
-    *)
-      echo "$line" >> "$tmp_file"
-      ;;
-  esac
-done < "$pool_config_file"
-mv "$tmp_file" "$pool_config_file"
-
-log_message "Updated pool configuration in $pool_config_file"
-
-escaped_sock_path=$(echo $sock_path | sed 's/\//\\\//g')
-
-# Update vhost template in the database
-vhost_template=$(sqlite3 /home/clp/htdocs/app/data/db.sq3 "SELECT vhost_template FROM site WHERE id = $site_id")
-updated_vhost_template=$(echo "$vhost_template" | sed "s/fastcgi_pass 127.0.0.1:{{php_fpm_port}}/fastcgi_pass unix:$escaped_sock_path;/")
-escaped_string="${updated_vhost_template//\'/\'\'}"
-sqlite3 /home/clp/htdocs/app/data/db.sq3 "UPDATE site SET vhost_template = '$escaped_string' WHERE id = $site_id;"
-check_success "Failed to update site vhost in CloudPanel database."
-log_message "Updated site vhost in CloudPanel database"
-
-# Update NGINX configuration
-nginx_config_file="/etc/nginx/sites-enabled/$domain_name.conf"
-if [ -f "$nginx_config_file" ]; then
-  cp "$nginx_config_file" "$nginx_config_file.bak"
-  sed -i "s/fastcgi_pass 127.0.0.1:[0-9]\+;/fastcgi_pass unix:$escaped_sock_path;/" "$nginx_config_file"
-  check_success "Failed to update $nginx_config_file"
-  log_message "Successfully updated $nginx_config_file"
-else
-  log_message "Error: NGINX configuration file $nginx_config_file not found"
-  exit 8
-fi
-
-# Restart services
-systemctl restart "php$php_version-fpm.service"
-check_success "Failed to restart PHP-FPM service."
-log_message "Restarted PHP-FPM service $service_name"
-
-systemctl reload nginx
-check_success "Failed to reload NGINX service."
-log_message "Reloaded NGINX service"
-
-log_message "Migration completed for $domain_name"
+log_message "Bulk migration of PHP domains to Unix sockets completed"
