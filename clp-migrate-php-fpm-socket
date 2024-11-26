@@ -93,7 +93,7 @@ for i in "${!domain_array[@]}"; do
 
   # Update vhost template in the database
   vhost_template=$(sqlite3 /home/clp/htdocs/app/data/db.sq3 "SELECT vhost_template FROM site WHERE id = $site_id")
-  updated_vhost_template=$(echo "$vhost_template" | sed "s/fastcgi_pass 127.0.0.1:{{php_fpm_port}}/fastcgi_pass unix:$escaped_sock_path;/")
+  updated_vhost_template=$(echo "$vhost_template" | sed "s/fastcgi_pass 127.0.0.1:{{php_fpm_port}};/fastcgi_pass unix:$escaped_sock_path;/")
   escaped_string="${updated_vhost_template//\'/\'\'}"
   sqlite3 /home/clp/htdocs/app/data/db.sq3 "UPDATE site SET vhost_template = '$escaped_string' WHERE id = $site_id;"
   check_success "Failed to update site vhost in CloudPanel database for $domain_name."
